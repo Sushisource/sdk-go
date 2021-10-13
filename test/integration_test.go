@@ -1221,6 +1221,11 @@ func (ts *IntegrationTestSuite) TestEndToEndLatencyMetrics() {
 	ts.Equal(prevNonLocalValue, nonLocal.Value())
 }
 
+func (ts *IntegrationTestSuite) TestCancelChildWithActivityAndCoroutines() {
+	err := ts.executeWorkflow("cancel-child-with-act-and-coroutines", ts.workflows.CancelChildWorkflowWithActivityAndCoroutines, nil)
+	ts.NoError(err)
+}
+
 func (ts *IntegrationTestSuite) registerNamespace() {
 	client, err := client.NewNamespaceClient(client.Options{HostPort: ts.config.ServiceAddr})
 	ts.NoError(err)

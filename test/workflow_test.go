@@ -25,6 +25,7 @@
 package test_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -34,6 +35,8 @@ import (
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/log"
 
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal"
@@ -1274,6 +1277,105 @@ func (w *Workflows) WaitSignalReturnParam(ctx workflow.Context, v interface{}) (
 	return v, nil
 }
 
+func (w *Workflows) CancelChildWorkflowWithActivityAndCoroutines(ctx workflow.Context) error {
+	options := workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+	}
+	ctx = workflow.WithActivityOptions(ctx, options)
+	ch := workflow.NewChannel(ctx)
+	logger := workflow.GetLogger(ctx)
+	child, cancel := w.spawnChild(ctx)
+	if err := child.GetChildWorkflowExecution().Get(ctx, nil); err != nil {
+		return fmt.Errorf("failed to start child workflow: %w", err)
+	}
+	workflow.GoNamed(ctx, "ctl", func(ctx workflow.Context) {
+		ctl(ctx, ch, logger)
+	})
+	res := ""
+	for {
+		s := workflow.NewSelector(ctx)
+		s.AddReceive(
+			ch,
+			func(c workflow.ReceiveChannel, more bool) {
+				_ = c.Receive(ctx, &res)
+			},
+		)
+		s.Select(ctx)
+
+		logger.Info("Received", "Value", res)
+		if res == "cancel" {
+			logger.Info("Canceling")
+			cancel()
+			r := child.Get(ctx, nil)
+			logger.Info("Canceled", "Result", r)
+			break
+		}
+	}
+	if err := workflow.Sleep(ctx, 30*time.Second); err != nil {
+		logger.Error("Workflow sleep failed", "Error", err)
+	}
+	return nil
+}
+
+func (w *Workflows) ChildForCancelWithActAndCoroutines(ctx workflow.Context) error {
+	options := workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+	}
+	ctx = workflow.WithActivityOptions(ctx, options)
+	if err := wait(ctx); err != nil {
+		return fmt.Errorf("wait failed: %w", err)
+	}
+	return nil
+}
+
+func (w *Workflows) spawnChild(ctx workflow.Context) (workflow.ChildWorkflowFuture, func()) {
+	ctx, cancel := workflow.WithCancel(ctx)
+	ctx = workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+		WaitForCancellation: true,
+	})
+	return workflow.ExecuteChildWorkflow(ctx, w.ChildForCancelWithActAndCoroutines), cancel
+}
+
+func Wait(ctx context.Context, d time.Duration) error {
+	deadline := time.Now().Add(d)
+	attempt := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+			activity.RecordHeartbeat(ctx, attempt)
+		}
+		attempt++
+		if time.Now().After(deadline) {
+			return nil
+		}
+	}
+}
+
+func wait(ctx workflow.Context) error {
+	t := 100 * 365 * 24 * time.Hour
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: t,
+		WaitForCancellation: true,
+		HeartbeatTimeout:    30 * time.Second,
+	})
+	return workflow.ExecuteActivity(ctx, Wait, t).Get(ctx, nil)
+}
+
+func ctl(ctx workflow.Context, ch workflow.Channel, logger log.Logger) {
+	for {
+		logger.Info("Execute wait in loop")
+		if err := workflow.ExecuteActivity(
+			ctx, Wait, 1*time.Second,
+		).Get(ctx, nil); err != nil {
+			logger.Error("Wait failed", "Error", err)
+		} else {
+			ch.Send(ctx, "cancel")
+		}
+	}
+}
+
 func (w *Workflows) register(worker worker.Worker) {
 	worker.RegisterWorkflow(w.ActivityCancelRepro)
 	worker.RegisterWorkflow(w.ActivityCompletionUsingID)
@@ -1327,6 +1429,10 @@ func (w *Workflows) register(worker worker.Worker) {
 	worker.RegisterWorkflow(w.CronWorkflow)
 	worker.RegisterWorkflow(w.CancelTimerConcurrentWithOtherCommandWorkflow)
 	worker.RegisterWorkflow(w.CancelMultipleCommandsOverMultipleTasks)
+	worker.RegisterWorkflow(w.CancelChildWorkflowWithActivityAndCoroutines)
+	worker.RegisterWorkflow(w.ChildForCancelWithActAndCoroutines)
+	// TODO: Move
+	worker.RegisterActivity(Wait)
 
 	worker.RegisterWorkflow(w.child)
 	worker.RegisterWorkflow(w.childForMemoAndSearchAttr)
